@@ -1,5 +1,5 @@
 resource "aws_vpc" "terraform_vpc" {
-  cidr_block           = "10.123.0.0/16"
+  cidr_block           = var.vpc_cidr
   enable_dns_support   = true
   enable_dns_hostnames = true
 
@@ -10,9 +10,9 @@ resource "aws_vpc" "terraform_vpc" {
 
 resource "aws_subnet" "terraform_subnet" {
   vpc_id                  = aws_vpc.terraform_vpc.id
-  cidr_block              = "10.123.1.0/24"
+  cidr_block              = var.subnet_cidr
   map_public_ip_on_launch = true
-  availability_zone       = "us-west-2a"
+  availability_zone       = var.availability_zone
 
   tags = {
     Name = "terraform_subnet"
@@ -59,9 +59,7 @@ resource "aws_security_group" "tf_secgrp" {
 resource "aws_vpc_security_group_ingress_rule" "tf_allow_tls_ipv4" {
   security_group_id = aws_security_group.tf_secgrp.id
   cidr_ipv4         = "0.0.0.0/0"
-  from_port         = 0
   ip_protocol       = -1
-  to_port           = 0
 }
 
 resource "aws_vpc_security_group_egress_rule" "tf_allow_all_traffic_ipv4" {
@@ -72,12 +70,12 @@ resource "aws_vpc_security_group_egress_rule" "tf_allow_all_traffic_ipv4" {
 
 resource "aws_key_pair" "tfkey" {
   key_name   = "tf-key"
-  public_key = file("~/.ssh/id_rsa")
+  public_key = file("~/.ssh/id_rsa.pub")
 }
 
 resource "aws_instance" "tf_ec2" {
-  availability_zone = "us-west-2"
-  instance_type     = "t2.micro"
+  availability_zone = var.availability_zone
+  instance_type     = var.instance_type
   key_name          = aws_key_pair.tfkey.id
   tags = {
     name = "tf_ec2"
@@ -85,5 +83,5 @@ resource "aws_instance" "tf_ec2" {
   ami                    = data.aws_ami.ubuntu_bionic.id
   vpc_security_group_ids = [aws_security_group.tf_secgrp.id]
   subnet_id              = aws_subnet.terraform_subnet.id
-  user_data = file("userdata.tpl")
+  user_data              = file("userdata.tpl")
 }

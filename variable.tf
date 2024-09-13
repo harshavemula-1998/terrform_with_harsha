@@ -1,7 +1,7 @@
 variable "region" {
   description = "The AWS region to deploy resources"
   type        = string
-  default     = "us-east-1"
+  default     = "us-west-1"
 }
 
 variable "instance_type" {
@@ -10,19 +10,23 @@ variable "instance_type" {
   default     = "t2.micro"
 }
 
-variable "ami" {
-  description = "The AMI ID to use for the instance"
-  type        = string
-}
-
 variable "availability_zone" {
   description = "The Availability Zone to deploy the instance in"
   type        = string
-  default     = "us-east-1a"
+  default     = "us-west-2a"
 }
 
-variable "instance_count" {
-  description = "Number of EC2 instances to launch"
-  type        = number
-  default     = 1
+variable "vpc_cidr" {
+  description = "The cidr block of VPC"
+  type        = string
+  default     = "10.123.0.0/16"
+
 }
+
+variable "subnet_cidr" {
+  description = "The cidr block of Subnet"
+  type        = string
+  default     = "10.123.1.0/24"
+
+}
+

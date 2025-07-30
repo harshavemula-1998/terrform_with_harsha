@@ -1,87 +1,209 @@
-resource "aws_vpc" "terraform_vpc" {
-  cidr_block           = var.vpc_cidr
-  enable_dns_support   = true
-  enable_dns_hostnames = true
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 4.0"
+    }
+  }
+  required_version = ">= 1.0"
+}
 
-  tags = {
-    Name = "terraform_based"
+# Add local values for better organization
+locals {
+  project_name = "openai-chatbot"
+  environment  = "prod"
+  
+  common_tags = {
+    Project     = local.project_name
+    Environment = local.environment
+    ManagedBy   = "Terraform"
   }
 }
 
-resource "aws_subnet" "terraform_subnet" {
-  vpc_id                  = aws_vpc.terraform_vpc.id
-  cidr_block              = var.subnet_cidr
-  map_public_ip_on_launch = true
-  availability_zone       = var.availability_zone
+provider "aws" {
+  region                   = "us-west-2"
+  shared_credentials_files = ["~/.aws/credentials"]
+  profile                  = "default"
+}
 
-  tags = {
-    Name = "terraform_subnet"
+
+resource "aws_iam_role" "lambda_exec_role" {
+  name = "${local.project_name}-lambda-exec-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+    }]
+  })
+
+  tags = local.common_tags
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_basic_exec" {
+  role       = aws_iam_role.lambda_exec_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+# Add CloudWatch Logs policy for better monitoring
+resource "aws_iam_role_policy" "lambda_logs_policy" {
+  name = "${local.project_name}-lambda-logs-policy"
+  role = aws_iam_role.lambda_exec_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:*:*:*"
+      }
+    ]
+  })
+}
+
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/lambda"
+  output_path = "${path.module}/lambda.zip"
+}
+
+resource "aws_lambda_function" "openai_chatbot" {
+  function_name = "${local.project_name}-function"
+  role          = aws_iam_role.lambda_exec_role.arn
+  handler       = "index.handler"
+  runtime       = "nodejs18.x"
+  filename      = data.archive_file.lambda_zip.output_path
+  timeout       = 30
+  memory_size   = 256
+  
+  environment {
+    variables = {
+      OPENAI_API_KEY = var.openai_api_key
+      NODE_ENV       = "production"
+    }
   }
+
+  # Enable CloudWatch Logs
+  depends_on = [
+    aws_iam_role_policy_attachment.lambda_basic_exec,
+    aws_iam_role_policy.lambda_logs_policy,
+    aws_cloudwatch_log_group.lambda_logs
+  ]
+
+  tags = local.common_tags
 }
 
-resource "aws_internet_gateway" "tf_igw" {
-  vpc_id = aws_vpc.terraform_vpc.id
-  tags = {
-    Name = "tf_igw"
+# CloudWatch Log Group for Lambda
+resource "aws_cloudwatch_log_group" "lambda_logs" {
+  name              = "/aws/lambda/${local.project_name}-function"
+  retention_in_days = 7
+  tags              = local.common_tags
+}
+
+resource "aws_apigatewayv2_api" "http_api" {
+  name          = "${local.project_name}-api"
+  protocol_type = "HTTP"
+  description   = "OpenAI Chatbot HTTP API"
+
+  cors_configuration {
+    allow_credentials = false
+    allow_headers     = ["content-type", "authorization"]
+    allow_methods     = ["POST", "OPTIONS"]
+    allow_origins     = ["*"]  # Restrict this to your domain in production
+    max_age          = 86400
   }
+
+  tags = local.common_tags
 }
 
-resource "aws_route_table" "tf_routetable" {
-  vpc_id = aws_vpc.terraform_vpc.id
-  tags = {
-    Name = "tf_routetable"
+resource "aws_apigatewayv2_integration" "lambda_integration" {
+  api_id                 = aws_apigatewayv2_api.http_api.id
+  integration_type       = "AWS_PROXY"
+  integration_uri        = aws_lambda_function.openai_chatbot.invoke_arn
+  integration_method     = "POST"
+  payload_format_version = "2.0"
+  timeout_milliseconds   = 30000
+}
+
+resource "aws_apigatewayv2_route" "default" {
+  api_id    = aws_apigatewayv2_api.http_api.id
+  route_key = "POST /chat"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda_integration.id}"
+}
+
+resource "aws_lambda_permission" "api_gateway_invoke" {
+  statement_id  = "AllowAPIGatewayInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.openai_chatbot.arn
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.http_api.execution_arn}/*/*"
+}
+
+resource "aws_apigatewayv2_stage" "default_stage" {
+  api_id      = aws_apigatewayv2_api.http_api.id
+  name        = "$default"
+  auto_deploy = true
+
+  # Enable access logging
+  access_log_settings {
+    destination_arn = aws_cloudwatch_log_group.api_gateway_logs.arn
+    format = jsonencode({
+      requestId      = "$context.requestId"
+      ip             = "$context.identity.sourceIp"
+      requestTime    = "$context.requestTime"
+      httpMethod     = "$context.httpMethod"
+      routeKey       = "$context.routeKey"
+      status         = "$context.status"
+      protocol       = "$context.protocol"
+      responseLength = "$context.responseLength"
+      error          = "$context.error.message"
+      integrationError = "$context.integrationErrorMessage"
+    })
   }
+
+  tags = local.common_tags
 }
 
-resource "aws_route" "tf_route" {
-  route_table_id         = aws_route_table.tf_routetable.id
-  destination_cidr_block = "0.0.0.0/0"
-  gateway_id             = aws_internet_gateway.tf_igw.id
+# CloudWatch Log Group for API Gateway
+resource "aws_cloudwatch_log_group" "api_gateway_logs" {
+  name              = "/aws/apigateway/${local.project_name}-api"
+  retention_in_days = 7
+  tags              = local.common_tags
 }
 
-resource "aws_route_table_association" "tf_route_assc" {
-  subnet_id      = aws_subnet.terraform_subnet.id
-  route_table_id = aws_route_table.tf_routetable.id
+# Remove the separate OPTIONS route since CORS is now handled at the API level
+
+
+
+variable "openai_api_key" {
+  description = "OpenAI secret project key"
+  type        = string
+  sensitive   = true
+  # Remove the default value for security - pass via environment variable or terraform.tfvars
 }
 
 
-
-resource "aws_security_group" "tf_secgrp" {
-
-  name        = "tf_secgrp"
-  description = "Allow TLS inbound traffic and all outbound traffic"
-  vpc_id      = aws_vpc.terraform_vpc.id
-  tags = {
-    Name = "tf_secgrp"
-  }
+output "api_url" {
+  description = "The API Gateway endpoint URL"
+  value       = "${aws_apigatewayv2_api.http_api.api_endpoint}/chat"
 }
 
-resource "aws_vpc_security_group_ingress_rule" "tf_allow_tls_ipv4" {
-  security_group_id = aws_security_group.tf_secgrp.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = -1
+output "lambda_function_name" {
+  description = "Name of the Lambda function"
+  value       = aws_lambda_function.openai_chatbot.function_name
 }
 
-resource "aws_vpc_security_group_egress_rule" "tf_allow_all_traffic_ipv4" {
-  security_group_id = aws_security_group.tf_secgrp.id
-  cidr_ipv4         = "0.0.0.0/0"
-  ip_protocol       = "-1" # semantically equivalent to all ports
+data "aws_caller_identity" "current" {}
+
+output "account_id" {
+  description = "AWS Account ID"
+  value       = data.aws_caller_identity.current.account_id
 }
 
-resource "aws_key_pair" "tfkey" {
-  key_name   = "tf-key"
-  public_key = file("~/.ssh/id_rsa.pub")
-}
-
-resource "aws_instance" "tf_ec2" {
-  availability_zone = var.availability_zone
-  instance_type     = var.instance_type
-  key_name          = aws_key_pair.tfkey.id
-  tags = {
-    name = "tf_ec2"
-  }
-  ami                    = data.aws_ami.ubuntu_bionic.id
-  vpc_security_group_ids = [aws_security_group.tf_secgrp.id]
-  subnet_id              = aws_subnet.terraform_subnet.id
-  user_data              = file("userdata.tpl")
-}
